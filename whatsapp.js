@@ -7,6 +7,7 @@ const {
 const pino = require("pino");
 const path = require("path");
 const fs = require("fs");
+require("dotenv").config();
 
 const { isProcessed, markProcessed } = require("./message-cache");
 
@@ -32,17 +33,30 @@ async function callApi(endpoint, method = "GET", body = null) {
   return data;
 }
 
-async function handleMessage(sock, sender, text) {
-  const normalizedText = text.trim().toLowerCase();
+// ── MAIN MESSAGE ROUTER ───────────────────────────────────────────────
 
-  // ── GOOGLE AUTH FLOW ──────────────────────────────────────────────
+async function handleMessage(sock, sender, msg) {
+  const text =
+    msg.message?.conversation?.trim() ||
+    msg.message?.extendedTextMessage?.text?.trim() ||
+    "";
+
+  const normalizedText = text.toLowerCase();
+
+  if (normalizedText === "entregar atividade") {
+    await sock.sendMessage(sender, {
+      text:
+        "⏳ O envio de atividades diretamente pelo bot ainda não está disponível.\n\n" +
+        "Estamos trabalhando nessa funcionalidade e em breve você poderá entregar suas atividades por aqui. Fique ligado nas novidades! 🚀",
+    });
+    return;
+  }
+
   if (normalizedText === "google") {
     try {
       const data = await callApi(
-        `/auth/google/start?whatsappNumber=${encodeURIComponent(sender)}`,
-        "GET"
+        `/auth/google/start?whatsappNumber=${encodeURIComponent(sender)}`
       );
-
       if (data.authUrl) {
         await sock.sendMessage(sender, {
           text: `🔗 Clique no link abaixo para conectar sua conta do Google Classroom:\n\n${data.authUrl}`,
@@ -61,25 +75,19 @@ async function handleMessage(sock, sender, text) {
     return;
   }
 
-  // ── LIST GOOGLE CLASSROOM ACTIVITIES ─────────────────────────────
   if (normalizedText === "atividades google") {
     try {
       const data = await callApi(
-        `/classroom/activities?whatsappNumber=${encodeURIComponent(sender)}`,
-        "GET"
+        `/classroom/activities?whatsappNumber=${encodeURIComponent(sender)}`
       );
 
       if (data.error) {
-        await sock.sendMessage(sender, {
-          text: `⚠️ ${data.error}`,
-        });
+        await sock.sendMessage(sender, { text: `⚠️ ${data.error}` });
         return;
       }
 
       if (!data.activities || data.activities.length === 0) {
-        await sock.sendMessage(sender, {
-          text: "📭 Não há atividades.",
-        });
+        await sock.sendMessage(sender, { text: "📭 Não há atividades." });
         return;
       }
 
@@ -99,11 +107,13 @@ async function handleMessage(sock, sender, text) {
     return;
   }
 
-  // ── DEFAULT RESPONSE ──────────────────────────────────────────────
+  // ── Default response ──────────────────────────────────────────────
   await sock.sendMessage(sender, {
     text: "Olá, ainda estou em desenvolvimento! 🚀",
   });
 }
+
+// ── BAILEYS SETUP ─────────────────────────────────────────────────────
 
 async function startWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
@@ -169,10 +179,10 @@ async function startWhatsApp() {
         msg.message?.extendedTextMessage?.text?.trim() ||
         "";
 
-      console.log(`[WhatsApp] Message received from [${sender}]: "${text}"`);
+      console.log(`[WhatsApp] Message received from [${sender}]: "${text || "(file)"}"`);
 
       try {
-        await handleMessage(sock, sender, text);
+        await handleMessage(sock, sender, msg);
       } catch (error) {
         console.error(`[WhatsApp] Unhandled error for [${sender}]:`, error.message);
       }
