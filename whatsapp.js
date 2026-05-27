@@ -205,7 +205,26 @@ async function handleMessage(sock, sender, msg) {
   // ── Fresh commands ────────────────────────────────────────────────
 
   if (normalizedText === "entregar atividade") {
+    await sock.sendMessage(sender, {
+      text:
+        "📬 Para entregar uma atividade, especifique a plataforma:\n\n" +
+        "• Digite *entregar atividade ava* para entregar no AVA (Moodle)\n" +
+        "• Digite *entregar atividade google* para entregar no Google Classroom",
+    });
+    return;
+  }
+
+  if (normalizedText === "entregar atividade ava") {
     await handleDeliverActivityStart(sender);
+    return;
+  }
+
+  if (normalizedText === "entregar atividade google") {
+    await sock.sendMessage(sender, {
+      text:
+        "⏳ A entrega de atividades pelo Google Classroom ainda não está disponível.\n\n" +
+        "Estamos trabalhando nessa funcionalidade e em breve você poderá entregar suas atividades por aqui. Fique atento às novidades! 🚀",
+    });
     return;
   }
 
