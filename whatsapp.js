@@ -3,6 +3,7 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  downloadMediaMessage,
 } = require("@whiskeysockets/baileys");
 const pino = require("pino");
 const path = require("path");
@@ -33,6 +34,138 @@ async function callApi(endpoint, method = "GET", body = null) {
   return data;
 }
 
+// ── CONVERSATION STATE ────────────────────────────────────────────────
+// Map<whatsappNumber, { step, activities, selectedActivity }>
+// step values:
+//   "AWAITING_ACTIVITY_NUMBER" — bot listed activities, waiting for user to pick one
+//   "AWAITING_FILE"            — user picked activity, waiting for file
+const conversationState = new Map();
+
+async function callApiMultipart(endpoint, formData) {
+  const response = await fetch(`${API_URL}${endpoint}`, {
+    method: "POST",
+    body: formData,
+  });
+  return await response.json();
+}
+
+// ── MESSAGE HANDLERS ──────────────────────────────────────────────────
+
+async function handleDeliverActivityStart(sender) {
+  const data = await callApi(
+    `/ava/activities?whatsappNumber=${encodeURIComponent(sender)}`
+  );
+
+  if (data.error) {
+    await sock.sendMessage(sender, { text: `⚠️ ${data.error}` });
+    return;
+  }
+
+  if (!data.activities || data.activities.length === 0) {
+    await sock.sendMessage(sender, {
+      text: "📭 Não há atividades disponíveis no AVA para entrega.",
+    });
+    return;
+  }
+
+  conversationState.set(sender, {
+    step: "AWAITING_ACTIVITY_NUMBER",
+    activities: data.activities,
+    selectedActivity: null,
+  });
+
+  const lines = data.activities.map(
+    (a, i) => `${i + 1} - ${a.title} — ${a.courseName}`
+  );
+
+  await sock.sendMessage(sender, {
+    text: `📋 *Digite o número da atividade:*\n\n${lines.join("\n")}`,
+  });
+}
+
+async function handleActivityNumberInput(sender, text, state) {
+  const index = parseInt(text.trim(), 10) - 1;
+
+  if (isNaN(index) || index < 0 || index >= state.activities.length) {
+    await sock.sendMessage(sender, {
+      text: `❌ Número inválido. Digite um número entre 1 e ${state.activities.length}.`,
+    });
+    return;
+  }
+
+  const selected = state.activities[index];
+
+  conversationState.set(sender, {
+    ...state,
+    step: "AWAITING_FILE",
+    selectedActivity: selected,
+  });
+
+  await sock.sendMessage(sender, {
+    text: `📎 Atividade selecionada: *${selected.title}*\n\nMande o arquivo da atividade.`,
+  });
+}
+
+async function handleFileSubmission(sender, msg, state) {
+  const selected = state.selectedActivity;
+
+  const fileType =
+    msg.message.documentMessage ||
+    msg.message.documentWithCaptionMessage?.message?.documentMessage ||
+    msg.message.imageMessage ||
+    msg.message.videoMessage ||
+    msg.message.audioMessage ||
+    null;
+
+  if (!fileType) {
+    await sock.sendMessage(sender, {
+      text: "❌ Não consegui processar o arquivo. Tente enviar novamente.",
+    });
+    return;
+  }
+
+  const buffer = await downloadMediaMessage(msg, "buffer", {});
+
+  const originalFilename = fileType.fileName || fileType.title || `arquivo-${Date.now()}`;
+  const mimetype = fileType.mimetype || "application/octet-stream";
+
+  console.log("\n==============================================");
+  console.log("[FILE RECEIVED FROM WHATSAPP]");
+  console.log(`From:          ${sender}`);
+  console.log(`Activity:      ${selected.title} (ID: ${selected.id})`);
+  console.log(`Course ID:     ${selected.courseId}`);
+  console.log(`File Name:     ${originalFilename}`);
+  console.log(`MIME Type:     ${mimetype}`);
+  console.log(`Size (bytes):  ${buffer.length}`);
+  console.log("==============================================\n");
+
+  const form = new global.FormData();
+  form.append("whatsappNumber", sender);
+  form.append("courseId", String(selected.courseId));
+  form.append("activityId", String(selected.id));
+  form.append(
+    "file",
+    new Blob([buffer], { type: mimetype }),
+    originalFilename
+  );
+
+  await sock.sendMessage(sender, { text: "⏳ Enviando sua atividade para o AVA..." });
+
+  const result = await callApiMultipart("/ava/submit", form);
+
+  conversationState.delete(sender);
+
+  if (result.ok) {
+    await sock.sendMessage(sender, {
+      text: `✅ Atividade *${selected.title}* entregue com sucesso no AVA! 🎉`,
+    });
+  } else {
+    await sock.sendMessage(sender, {
+      text: `❌ Falha ao enviar: ${result.error || "Erro desconhecido."}`,
+    });
+  }
+}
+
 // ── MAIN MESSAGE ROUTER ───────────────────────────────────────────────
 
 async function handleMessage(sock, sender, msg) {
@@ -42,13 +175,37 @@ async function handleMessage(sock, sender, msg) {
     "";
 
   const normalizedText = text.toLowerCase();
+  const state = conversationState.get(sender);
+
+  // ── Handle in-progress conversation states first ──────────────────
+
+  if (state?.step === "AWAITING_ACTIVITY_NUMBER") {
+    await handleActivityNumberInput(sender, text, state);
+    return;
+  }
+
+  if (state?.step === "AWAITING_FILE") {
+    const hasFile =
+      msg.message?.documentMessage ||
+      msg.message?.documentWithCaptionMessage ||
+      msg.message?.imageMessage ||
+      msg.message?.videoMessage ||
+      msg.message?.audioMessage;
+
+    if (hasFile) {
+      await handleFileSubmission(sender, msg, state);
+    } else {
+      await sock.sendMessage(sender, {
+        text: "📎 Por favor, envie o arquivo da atividade.",
+      });
+    }
+    return;
+  }
+
+  // ── Fresh commands ────────────────────────────────────────────────
 
   if (normalizedText === "entregar atividade") {
-    await sock.sendMessage(sender, {
-      text:
-        "⏳ O envio de atividades diretamente pelo bot ainda não está disponível.\n\n" +
-        "Estamos trabalhando nessa funcionalidade e em breve você poderá entregar suas atividades por aqui. Fique ligado nas novidades! 🚀",
-    });
+    await handleDeliverActivityStart(sender);
     return;
   }
 
