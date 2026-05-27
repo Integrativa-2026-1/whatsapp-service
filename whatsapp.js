@@ -230,6 +230,17 @@ async function handleMessage(sock, sender, msg) {
 
   if (normalizedText === "google") {
     try {
+      const statusData = await callApi(
+        `/auth/status?whatsappNumber=${encodeURIComponent(sender)}`
+      );
+
+      if (statusData.googleConnected) {
+        await sock.sendMessage(sender, {
+          text: "✅ Você já está conectado ao Google Classroom!",
+        });
+        return;
+      }
+
       const data = await callApi(
         `/auth/google/start?whatsappNumber=${encodeURIComponent(sender)}`
       );
@@ -254,6 +265,17 @@ async function handleMessage(sock, sender, msg) {
   // ── AVA AUTH FLOW ─────────────────────────────────────────────────
   if (normalizedText === "ava") {
     try {
+      const statusData = await callApi(
+        `/auth/status?whatsappNumber=${encodeURIComponent(sender)}`
+      );
+
+      if (statusData.avaConnected) {
+        await sock.sendMessage(sender, {
+          text: "✅ Você já está conectado ao AVA!",
+        });
+        return;
+      }
+
       const data = await callApi(
         `/auth/ava/start?whatsappNumber=${encodeURIComponent(sender)}`
       );
