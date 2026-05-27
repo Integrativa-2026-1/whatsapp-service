@@ -11,6 +11,8 @@ const fs = require("fs");
 require("dotenv").config();
 
 const { isProcessed, markProcessed } = require("./message-cache");
+const { parseIntent } = require("./intent-parser");
+const { classifyWithOllama } = require("./ollama-service");
 
 const AUTH_FOLDER = path.join(__dirname, "auth");
 const API_URL = process.env.API_UNIENTREGA_URL;
@@ -174,10 +176,8 @@ async function handleMessage(sock, sender, msg) {
     msg.message?.extendedTextMessage?.text?.trim() ||
     "";
 
-  const normalizedText = text.toLowerCase();
+  // ── In-progress conversation states take absolute priority ────────
   const state = conversationState.get(sender);
-
-  // ── Handle in-progress conversation states first ──────────────────
 
   if (state?.step === "AWAITING_ACTIVITY_NUMBER") {
     await handleActivityNumberInput(sender, text, state);
@@ -202,173 +202,230 @@ async function handleMessage(sock, sender, msg) {
     return;
   }
 
-  // ── Fresh commands ────────────────────────────────────────────────
-
-  if (normalizedText === "entregar atividade") {
+  // ── Skip classification if no text (file sent outside of a flow) ─
+  if (!text) {
     await sock.sendMessage(sender, {
-      text:
-        "📬 Para entregar uma atividade, especifique a plataforma:\n\n" +
-        "• Digite *entregar atividade ava* para entregar no AVA (Moodle)\n" +
-        "• Digite *entregar atividade google* para entregar no Google Classroom",
+      text: "Olá! 👋 Sou seu assistente acadêmico. Envie uma mensagem de texto para começarmos!",
     });
     return;
   }
 
-  if (normalizedText === "entregar atividade ava") {
-    await handleDeliverActivityStart(sender);
-    return;
-  }
+  // ── Layer 1: Fast deterministic parser ────────────────────────────
+  const deterministic = parseIntent(text);
+  let finalIntent = deterministic.matched ? deterministic.intent : null;
 
-  if (normalizedText === "entregar atividade google") {
-    await sock.sendMessage(sender, {
-      text:
-        "⏳ A entrega de atividades pelo Google Classroom ainda não está disponível.\n\n" +
-        "Estamos trabalhando nessa funcionalidade e em breve você poderá entregar suas atividades por aqui. Fique atento às novidades! 🚀",
-    });
-    return;
-  }
+  // ── Layer 2: Ollama classification for ambiguous messages ─────────
+  let ollamaResult = null;
+  let chatResponse = null;
+  let platform = deterministic.platform;
 
-  if (normalizedText === "google") {
+  if (!deterministic.matched) {
+    let context = { googleConnected: false, avaConnected: false };
     try {
       const statusData = await callApi(
         `/auth/status?whatsappNumber=${encodeURIComponent(sender)}`
       );
+      context.googleConnected = !!statusData.googleConnected;
+      context.avaConnected = !!statusData.avaConnected;
+    } catch (_) {}
 
-      if (statusData.googleConnected) {
-        await sock.sendMessage(sender, {
-          text: "✅ Você já está conectado ao Google Classroom!",
-        });
-        return;
-      }
+    ollamaResult = await classifyWithOllama(text, context);
+    finalIntent = ollamaResult.intent;
+    chatResponse = ollamaResult.chatResponse;
+    platform = ollamaResult.platform || deterministic.platform;
 
-      const data = await callApi(
-        `/auth/google/start?whatsappNumber=${encodeURIComponent(sender)}`
-      );
-      if (data.authUrl) {
-        await sock.sendMessage(sender, {
-          text: `🔗 Clique no link abaixo para conectar sua conta do Google Classroom:\n\n${data.authUrl}`,
-        });
-      } else {
-        await sock.sendMessage(sender, {
-          text: "❌ Não foi possível gerar o link de autenticação. Tente novamente.",
-        });
-      }
-    } catch (error) {
-      console.error("[WhatsApp] Error fetching Google auth URL:", error.message);
-      await sock.sendMessage(sender, {
-        text: "❌ Erro ao conectar com o serviço. Tente novamente em instantes.",
-      });
+    if (ollamaResult.requiresPlatformChoice || finalIntent === "AMBIGUOUS_PLATFORM") {
+      await sock.sendMessage(sender, { text: chatResponse });
+      return;
     }
-    return;
   }
 
-  // ── AVA AUTH FLOW ─────────────────────────────────────────────────
-  if (normalizedText === "ava") {
-    try {
-      const statusData = await callApi(
-        `/auth/status?whatsappNumber=${encodeURIComponent(sender)}`
-      );
+  // ── Route to the correct action ───────────────────────────────────
 
-      if (statusData.avaConnected) {
+  switch (finalIntent) {
+
+    case "GREETING":
+      await sock.sendMessage(sender, {
+        text: chatResponse ||
+          "Olá! 👋 Sou seu assistente acadêmico pessoal. Estou aqui para te ajudar com suas atividades, prazos e muito mais!\n\n" +
+          "Você pode me pedir coisas como:\n" +
+          "• *atividades ava* — ver suas tarefas no AVA\n" +
+          "• *atividades google* — ver suas tarefas no Google Classroom\n" +
+          "• *entregar atividade ava* — entregar uma atividade no AVA\n" +
+          "• *ava* ou *google* — conectar suas contas\n\n" +
+          "Como posso te ajudar hoje? 😊",
+      });
+      break;
+
+    case "CONNECT_GOOGLE": {
+      try {
+        const statusData = await callApi(
+          `/auth/status?whatsappNumber=${encodeURIComponent(sender)}`
+        );
+        if (statusData.googleConnected) {
+          await sock.sendMessage(sender, { text: "✅ Você já está conectado ao Google Classroom!" });
+          return;
+        }
+        const data = await callApi(
+          `/auth/google/start?whatsappNumber=${encodeURIComponent(sender)}`
+        );
+        if (data.authUrl) {
+          await sock.sendMessage(sender, {
+            text: `🔗 Clique no link abaixo para conectar sua conta do Google Classroom:\n\n${data.authUrl}`,
+          });
+        } else {
+          await sock.sendMessage(sender, {
+            text: "❌ Não foi possível gerar o link de autenticação. Tente novamente.",
+          });
+        }
+      } catch (error) {
+        console.error("[WhatsApp] Error fetching Google auth URL:", error.message);
         await sock.sendMessage(sender, {
-          text: "✅ Você já está conectado ao AVA!",
+          text: "❌ Erro ao conectar com o serviço. Tente novamente em instantes.",
         });
-        return;
       }
+      break;
+    }
 
-      const data = await callApi(
-        `/auth/ava/start?whatsappNumber=${encodeURIComponent(sender)}`
-      );
+    case "CONNECT_AVA": {
+      try {
+        const statusData = await callApi(
+          `/auth/status?whatsappNumber=${encodeURIComponent(sender)}`
+        );
+        if (statusData.avaConnected) {
+          await sock.sendMessage(sender, { text: "✅ Você já está conectado ao AVA!" });
+          return;
+        }
+        const data = await callApi(
+          `/auth/ava/start?whatsappNumber=${encodeURIComponent(sender)}`
+        );
+        if (data.formUrl) {
+          await sock.sendMessage(sender, {
+            text:
+              `🎓 Clique no link abaixo para conectar sua conta do AVA (Moodle):\n\n${data.formUrl}\n\n` +
+              `_Insira seu usuário e senha do AVA no formulário que vai abrir._`,
+          });
+        } else {
+          await sock.sendMessage(sender, {
+            text: "❌ Não foi possível gerar o link de acesso ao AVA. Tente novamente.",
+          });
+        }
+      } catch (error) {
+        console.error("[WhatsApp] Error fetching AVA login URL:", error.message);
+        await sock.sendMessage(sender, {
+          text: "❌ Erro ao conectar com o serviço. Tente novamente em instantes.",
+        });
+      }
+      break;
+    }
 
-      if (data.formUrl) {
+    case "LIST_GOOGLE_ACTIVITIES": {
+      try {
+        const data = await callApi(
+          `/classroom/activities?whatsappNumber=${encodeURIComponent(sender)}`
+        );
+        if (data.error) {
+          await sock.sendMessage(sender, { text: `⚠️ ${data.error}` });
+          return;
+        }
+        if (!data.activities || data.activities.length === 0) {
+          await sock.sendMessage(sender, { text: "📭 Não há atividades no Google Classroom." });
+          return;
+        }
+        const lines = data.activities.map((a) => `📚 ${a.courseName} - ${a.title} - ${a.link}`);
+        await sock.sendMessage(sender, {
+          text: `📋 *Suas atividades no Google Classroom:*\n\n${lines.join("\n")}`,
+        });
+      } catch (error) {
+        console.error("[WhatsApp] Error fetching Google activities:", error.message);
+        await sock.sendMessage(sender, {
+          text: "❌ Erro ao buscar atividades. Tente novamente em instantes.",
+        });
+      }
+      break;
+    }
+
+    case "LIST_AVA_ACTIVITIES": {
+      try {
+        const data = await callApi(
+          `/ava/activities?whatsappNumber=${encodeURIComponent(sender)}`
+        );
+        if (data.error) {
+          await sock.sendMessage(sender, { text: `⚠️ ${data.error}` });
+          return;
+        }
+        if (!data.activities || data.activities.length === 0) {
+          await sock.sendMessage(sender, { text: "📭 Não há atividades no AVA." });
+          return;
+        }
+        const lines = data.activities.map((a) => `📚 ${a.courseName} - ${a.title}`);
+        await sock.sendMessage(sender, {
+          text: `📋 *Suas atividades no AVA:*\n\n${lines.join("\n")}`,
+        });
+      } catch (error) {
+        console.error("[WhatsApp] Error fetching AVA activities:", error.message);
+        await sock.sendMessage(sender, {
+          text: "❌ Erro ao buscar atividades do AVA. Tente novamente em instantes.",
+        });
+      }
+      break;
+    }
+
+    case "LIST_ACTIVITIES": {
+      await sock.sendMessage(sender, {
+        text: chatResponse ||
+          "📚 Ótimo, vou buscar suas atividades! Mas me diz: você quer ver as atividades do *Google Classroom* ou do *AVA*?",
+      });
+      break;
+    }
+
+    case "SUBMIT_AVA": {
+      await handleDeliverActivityStart(sender, "ava");
+      break;
+    }
+
+    case "SUBMIT_GOOGLE": {
+      await sock.sendMessage(sender, {
+        text:
+          "⏳ A entrega de atividades pelo Google Classroom ainda não está disponível.\n\n" +
+          "Estamos trabalhando nessa funcionalidade e em breve você poderá entregar suas atividades por aqui. Fique atento às novidades! 🚀",
+      });
+      break;
+    }
+
+    case "SUBMIT_ACTIVITY": {
+      await sock.sendMessage(sender, {
+        text: chatResponse ||
+          "📬 Para entregar uma atividade, especifique a plataforma:\n\n" +
+          "• Digite *entregar atividade ava* para entregar no AVA (Moodle)\n" +
+          "• Digite *entregar atividade google* para entregar no Google Classroom",
+      });
+      break;
+    }
+
+    case "CHAT":
+    default: {
+      if (chatResponse) {
+        await sock.sendMessage(sender, { text: chatResponse });
+
+        await new Promise((r) => setTimeout(r, 800));
+
         await sock.sendMessage(sender, {
           text:
-            `🎓 Clique no link abaixo para conectar sua conta do AVA (Moodle):\n\n${data.formUrl}\n\n` +
-            `_Insira seu usuário e senha do AVA no formulário que vai abrir._`,
+            "😄 Mas ei, sou especialista em assuntos acadêmicos! " +
+            "Que tal verificarmos suas atividades ou prazos? Posso te ajudar a ficar em dia com os estudos! 📚",
         });
       } else {
         await sock.sendMessage(sender, {
-          text: "❌ Não foi possível gerar o link de acesso ao AVA. Tente novamente.",
+          text:
+            "Hmm, não entendi muito bem. 🤔 Sou seu assistente acadêmico — " +
+            "posso te ajudar com atividades, prazos e entregas!\n\n" +
+            "Tente perguntar algo como *atividades ava* ou *entregar atividade ava*. 😊",
         });
       }
-    } catch (error) {
-      console.error("[WhatsApp] Error fetching AVA login URL:", error.message);
-      await sock.sendMessage(sender, {
-        text: "❌ Erro ao conectar com o serviço. Tente novamente em instantes.",
-      });
+      break;
     }
-    return;
   }
-
-  // ── LIST AVA ACTIVITIES ───────────────────────────────────────────
-  if (normalizedText === "atividades ava") {
-    try {
-      const data = await callApi(
-        `/ava/activities?whatsappNumber=${encodeURIComponent(sender)}`
-      );
-
-      if (data.error) {
-        await sock.sendMessage(sender, { text: `⚠️ ${data.error}` });
-        return;
-      }
-
-      if (!data.activities || data.activities.length === 0) {
-        await sock.sendMessage(sender, { text: "📭 Não há atividades no AVA." });
-        return;
-      }
-
-      const lines = data.activities.map(
-        (a) => `📚 ${a.courseName} - ${a.title}`
-      );
-
-      await sock.sendMessage(sender, {
-        text: `📋 *Suas atividades no AVA:*\n\n${lines.join("\n")}`,
-      });
-    } catch (error) {
-      console.error("[WhatsApp] Error fetching AVA activities:", error.message);
-      await sock.sendMessage(sender, {
-        text: "❌ Erro ao buscar atividades do AVA. Tente novamente em instantes.",
-      });
-    }
-    return;
-  }
-
-  if (normalizedText === "atividades google") {
-    try {
-      const data = await callApi(
-        `/classroom/activities?whatsappNumber=${encodeURIComponent(sender)}`
-      );
-
-      if (data.error) {
-        await sock.sendMessage(sender, { text: `⚠️ ${data.error}` });
-        return;
-      }
-
-      if (!data.activities || data.activities.length === 0) {
-        await sock.sendMessage(sender, { text: "📭 Não há atividades." });
-        return;
-      }
-
-      const lines = data.activities.map(
-        (a) => `📚 ${a.courseName} - ${a.title} - ${a.link}`
-      );
-
-      await sock.sendMessage(sender, {
-        text: `📋 *Suas atividades no Google Classroom:*\n\n${lines.join("\n")}`,
-      });
-    } catch (error) {
-      console.error("[WhatsApp] Error fetching activities:", error.message);
-      await sock.sendMessage(sender, {
-        text: "❌ Erro ao buscar atividades. Tente novamente em instantes.",
-      });
-    }
-    return;
-  }
-
-  // ── Default response ──────────────────────────────────────────────
-  await sock.sendMessage(sender, {
-    text: "Olá, ainda estou em desenvolvimento! 🚀",
-  });
 }
 
 // ── BAILEYS SETUP ─────────────────────────────────────────────────────
