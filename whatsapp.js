@@ -75,6 +75,66 @@ async function handleMessage(sock, sender, msg) {
     return;
   }
 
+  // ── AVA AUTH FLOW ─────────────────────────────────────────────────
+  if (normalizedText === "ava") {
+    try {
+      const data = await callApi(
+        `/auth/ava/start?whatsappNumber=${encodeURIComponent(sender)}`
+      );
+
+      if (data.formUrl) {
+        await sock.sendMessage(sender, {
+          text:
+            `🎓 Clique no link abaixo para conectar sua conta do AVA (Moodle):\n\n${data.formUrl}\n\n` +
+            `_Insira seu usuário e senha do AVA no formulário que vai abrir._`,
+        });
+      } else {
+        await sock.sendMessage(sender, {
+          text: "❌ Não foi possível gerar o link de acesso ao AVA. Tente novamente.",
+        });
+      }
+    } catch (error) {
+      console.error("[WhatsApp] Error fetching AVA login URL:", error.message);
+      await sock.sendMessage(sender, {
+        text: "❌ Erro ao conectar com o serviço. Tente novamente em instantes.",
+      });
+    }
+    return;
+  }
+
+  // ── LIST AVA ACTIVITIES ───────────────────────────────────────────
+  if (normalizedText === "atividades ava") {
+    try {
+      const data = await callApi(
+        `/ava/activities?whatsappNumber=${encodeURIComponent(sender)}`
+      );
+
+      if (data.error) {
+        await sock.sendMessage(sender, { text: `⚠️ ${data.error}` });
+        return;
+      }
+
+      if (!data.activities || data.activities.length === 0) {
+        await sock.sendMessage(sender, { text: "📭 Não há atividades no AVA." });
+        return;
+      }
+
+      const lines = data.activities.map(
+        (a) => `📚 ${a.courseName} - ${a.title}`
+      );
+
+      await sock.sendMessage(sender, {
+        text: `📋 *Suas atividades no AVA:*\n\n${lines.join("\n")}`,
+      });
+    } catch (error) {
+      console.error("[WhatsApp] Error fetching AVA activities:", error.message);
+      await sock.sendMessage(sender, {
+        text: "❌ Erro ao buscar atividades do AVA. Tente novamente em instantes.",
+      });
+    }
+    return;
+  }
+
   if (normalizedText === "atividades google") {
     try {
       const data = await callApi(
