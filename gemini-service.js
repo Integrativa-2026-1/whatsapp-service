@@ -24,6 +24,8 @@ setInterval(() => {
 }, 10 * 60 * 1000).unref();
 
 const SYSTEM_ACTIONS = [
+  "POST_LOGIN_GOOGLE",
+  "POST_LOGIN_AVA",
   "CONNECT_GOOGLE",
   "CONNECT_AVA",
   "LIST_GOOGLE_ACTIVITIES",
@@ -32,6 +34,8 @@ const SYSTEM_ACTIONS = [
   "SUBMIT_GOOGLE",
   "SUBMIT_AVA",
   "SUBMIT_ACTIVITY",
+  "GET_AVA_DEADLINES",
+  "GET_GOOGLE_DEADLINES",
   "GET_DEADLINES",
   "GET_GRADES",
   "GET_MATERIALS",
@@ -47,12 +51,20 @@ const FALLBACK = {
   requiresPlatformChoice: false,
 };
 
-function buildPrompt(message) {
+function buildPrompt(message, history = []) {
+  const historyBlock = history.length > 0
+    ? `\nRecent conversation (oldest first):\n${history.map((m) => `${m.role === "user" ? "User" : "Bot"}: ${m.text}`).join("\n")}\n`
+    : "";
+
   return `You are classifying messages for a WhatsApp academic assistant bot called UniEntrega.
 
 IMPORTANT: Return ONLY a valid JSON object. No markdown, no code blocks, no explanation.
+${historyBlock}
+Current user message: "${message}"
 
-User message: "${message}"
+Use the recent conversation above to understand context. For example:
+- If the bot previously asked "AVA ou Google Classroom?" and the user replies "classroom", classify as LIST_GOOGLE_ACTIVITIES or the relevant Google intent
+- If the bot previously asked about delivering an activity and the user replies with a platform name, classify accordingly
 
 Classify using ONLY these intent values:
 ${SYSTEM_ACTIONS.join(", ")}
@@ -60,11 +72,11 @@ ${SYSTEM_ACTIONS.join(", ")}
 Rules:
 - "intent" must be exactly one value from the list above
 - "platform" must be "GOOGLE", "AVA", or null
-- "requiresPlatformChoice" must be true only if intent is clear but platform is ambiguous
+- "requiresPlatformChoice" must be true only if intent is clear but platform is genuinely ambiguous with no context clues
 - "chatResponse" must ALWAYS be in Brazilian Portuguese
-- GREETING: warm welcome, say you are an academic assistant, list commands briefly
-- AMBIGUOUS_PLATFORM or requiresPlatformChoice true: ask which platform (Google Classroom ou AVA?)
-- CHAT (off-topic): answer naturally in Brazilian Portuguese, then gently nudge back to academic context
+- GREETING: warm welcome, say you are an academic assistant
+- AMBIGUOUS_PLATFORM or requiresPlatformChoice true: ask which platform naturally, no keywords
+- CHAT (off-topic): answer naturally in Brazilian Portuguese
 - Academic intents: short friendly acknowledgment in Brazilian Portuguese
 - When in doubt: use CHAT
 
@@ -92,20 +104,21 @@ function extractJSON(text) {
   return null;
 }
 
-async function classifyWithGemini(message, _context = {}, sender = null) {
+async function classifyWithGemini(message, _context = {}, sender = null, history = []) {
   if (!GEMINI_API_KEY) {
     console.error("[Gemini] GEMINI_API_KEY not set in .env");
     return FALLBACK;
   }
 
-  const cacheKey = `${sender || "unknown"}:${message.toLowerCase().trim()}`;
+  const historyKey = history.map((h) => h.text).join("|").slice(-60);
+  const cacheKey = `${sender || "unknown"}:${message.toLowerCase().trim()}:${historyKey}`;
   const cached = intentCache.get(cacheKey);
   if (cached) {
     console.log(`[Gemini] Cache hit for: "${message}"`);
     return cached.result;
   }
 
-  const prompt = buildPrompt(message);
+  const prompt = buildPrompt(message, history);
 
   try {
     const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);

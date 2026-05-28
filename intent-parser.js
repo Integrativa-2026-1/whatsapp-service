@@ -8,6 +8,26 @@ const PLATFORM_KEYWORDS = {
 
 const INTENT_RULES = [
   {
+    intent: "POST_LOGIN_GOOGLE",
+    patterns: [
+      "pronto ja fiz o login com o google",
+      "ja fiz o login com o google",
+      "login com o google",
+      "conectei o google",
+      "entrei com o google",
+    ],
+  },
+  {
+    intent: "POST_LOGIN_AVA",
+    patterns: [
+      "pronto ja fiz o login com o ava",
+      "ja fiz o login com o ava",
+      "login com o ava",
+      "conectei o ava",
+      "entrei com o ava",
+    ],
+  },
+  {
     intent: "CONNECT_GOOGLE",
     patterns: [
       "conectar google", "conectar classroom", "integrar google", "integrar classroom",
@@ -68,10 +88,26 @@ const INTENT_RULES = [
     ],
   },
   {
+    intent: "GET_AVA_DEADLINES",
+    patterns: [
+      "prazo ava", "prazos ava", "quando vence ava", "data entrega ava",
+      "proxima atividade ava", "deadline ava", "atividade mais proxima ava",
+    ],
+  },
+  {
+    intent: "GET_GOOGLE_DEADLINES",
+    patterns: [
+      "prazo google", "prazos google", "quando vence google", "data entrega google",
+      "proxima atividade google", "deadline google", "atividade mais proxima google",
+    ],
+  },
+  {
     intent: "GET_DEADLINES",
     patterns: [
       "prazos", "prazo", "datas", "vencimento", "quando vence", "quando e a entrega",
       "data de entrega", "deadline", "quando entregar", "proximo prazo",
+      "proxima atividade", "atividade mais proxima", "qual atividade vence primeiro",
+      "o que vence", "o que ta vencendo",
     ],
   },
   {

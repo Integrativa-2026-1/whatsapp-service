@@ -37,11 +37,30 @@ async function callApi(endpoint, method = "GET", body = null) {
 }
 
 // ── CONVERSATION STATE ────────────────────────────────────────────────
-// Map<whatsappNumber, { step, activities, selectedActivity }>
+// Map<whatsappNumber, { step, platform, activities, selectedActivity }>
 // step values:
-//   "AWAITING_ACTIVITY_NUMBER" — bot listed activities, waiting for user to pick one
-//   "AWAITING_FILE"            — user picked activity, waiting for file
+//   "AWAITING_ACTIVITY_SELECTION" — bot sent selection link, waiting for user to return
+//   "AWAITING_ACTIVITY_NUMBER"    — legacy fallback (number-based selection)
+//   "AWAITING_FILE"               — user picked activity, waiting for file
 const conversationState = new Map();
+
+// ── CONVERSATION HISTORY ──────────────────────────────────────────────
+// Map<sender, Array<{ role: "user"|"bot", text: string }>>
+// Keeps the last 6 messages per user to give Gemini context.
+const conversationHistory = new Map();
+const HISTORY_MAX = 6;
+
+function addToHistory(sender, role, text) {
+  if (!text || !text.trim()) return;
+  const history = conversationHistory.get(sender) || [];
+  history.push({ role, text: text.trim() });
+  if (history.length > HISTORY_MAX) history.shift();
+  conversationHistory.set(sender, history);
+}
+
+function getHistory(sender) {
+  return conversationHistory.get(sender) || [];
+}
 
 async function callApiMultipart(endpoint, formData) {
   const response = await fetch(`${API_URL}${endpoint}`, {
@@ -49,6 +68,19 @@ async function callApiMultipart(endpoint, formData) {
     body: formData,
   });
   return await response.json();
+}
+
+// Fetches a short-lived token from api-unientrega and returns a clean URL.
+// The user's WhatsApp JID (sender) is never exposed in the URL.
+async function getCleanUrl(path, sender) {
+  try {
+    const data = await callApi(`/token?w=${encodeURIComponent(sender)}`);
+    if (data.token) {
+      return `${API_URL}${path}?t=${data.token}`;
+    }
+  } catch (_) {}
+  // Fallback to w= param if token generation fails — better than breaking the flow
+  return `${API_URL}${path}?w=${encodeURIComponent(sender)}`;
 }
 
 async function sendTyping(sender, isTyping = true) {
@@ -59,72 +91,86 @@ async function sendTyping(sender, isTyping = true) {
   }
 }
 
+async function sendMessage(sender, textContent) {
+  await sendTyping(sender, false);
+  await sock.sendMessage(sender, { text: textContent });
+  addToHistory(sender, "bot", textContent);
+}
+
+// Checks if the user is authenticated for a given platform.
+// If not, sends a proactive login message and returns false.
+async function checkAuth(sender, platform) {
+  let statusData;
+  try {
+    statusData = await callApi(
+      `/auth/status?whatsappNumber=${encodeURIComponent(sender)}`
+    );
+  } catch (_) {
+    return true;
+  }
+
+  if (platform === "google" && !statusData.googleConnected) {
+    const googleLoginUrl = await getCleanUrl("/entrar/google", sender);
+    await sendMessage(sender,
+      "🔗 Parece que sua conta do Google Classroom ainda não está conectada!\n\n" +
+      `Clique no link para fazer login:\n${googleLoginUrl}`
+    );
+    return false;
+  }
+
+  if (platform === "ava" && !statusData.avaConnected) {
+    const avaLoginUrl = await getCleanUrl("/entrar/ava", sender);
+    await sendMessage(sender,
+      "🎓 Parece que sua conta do AVA ainda não está conectada!\n\n" +
+      `Clique no link para fazer login:\n${avaLoginUrl}`
+    );
+    return false;
+  }
+
+  return true;
+}
+
 // ── MESSAGE HANDLERS ──────────────────────────────────────────────────
 
 async function handleDeliverActivityStart(sender, platform = "ava") {
   await sendTyping(sender);
 
-  const endpoint =
-    platform === "google"
-      ? `/classroom/activities?whatsappNumber=${encodeURIComponent(sender)}`
-      : `/ava/activities?whatsappNumber=${encodeURIComponent(sender)}`;
+  const authed = await checkAuth(sender, platform);
+  if (!authed) return;
+
+  const endpoint = platform === "google"
+    ? `/classroom/activities?whatsappNumber=${encodeURIComponent(sender)}`
+    : `/ava/activities?whatsappNumber=${encodeURIComponent(sender)}`;
 
   const data = await callApi(endpoint);
+  const platformLabel = platform === "google" ? "Google Classroom" : "AVA";
 
   if (data.error) {
-    await sendTyping(sender, false);
-    await sock.sendMessage(sender, { text: `⚠️ ${data.error}` });
+    await sendMessage(sender, `⚠️ ${data.error}`);
     return;
   }
 
   if (!data.activities || data.activities.length === 0) {
-    await sendTyping(sender, false);
-    await sock.sendMessage(sender, {
-      text: `📭 Não há atividades disponíveis no ${platform === "google" ? "Google Classroom" : "AVA"} para entrega.`,
-    });
+    await sendMessage(sender, `📭 Não encontrei nenhuma atividade disponível no ${platformLabel} no momento.`);
     return;
   }
 
   conversationState.set(sender, {
-    step: "AWAITING_ACTIVITY_NUMBER",
+    step: "AWAITING_ACTIVITY_SELECTION",
     platform,
     activities: data.activities,
     selectedActivity: null,
   });
 
-  const lines = data.activities.map(
-    (a, i) => `${i + 1} - ${a.title} — ${a.courseName}`
+  const selectUrl = platform === "google"
+    ? await getCleanUrl("/atividades/google", sender)
+    : await getCleanUrl("/atividades/ava", sender);
+
+  await sendMessage(sender,
+    `📋 Aqui estão suas atividades do *${platformLabel}*!\n\n` +
+    `Clique no link, escolha a atividade e o WhatsApp vai abrir com ela selecionada:\n\n` +
+    `${selectUrl}`
   );
-
-  await sendTyping(sender, false);
-  await sock.sendMessage(sender, {
-    text: `📋 *Digite o número da atividade:*\n\n${lines.join("\n")}`,
-  });
-}
-
-async function handleActivityNumberInput(sender, text, state) {
-  const index = parseInt(text.trim(), 10) - 1;
-
-  if (isNaN(index) || index < 0 || index >= state.activities.length) {
-    await sendTyping(sender, false);
-    await sock.sendMessage(sender, {
-      text: `❌ Número inválido. Digite um número entre 1 e ${state.activities.length}.`,
-    });
-    return;
-  }
-
-  const selected = state.activities[index];
-
-  conversationState.set(sender, {
-    ...state,
-    step: "AWAITING_FILE",
-    selectedActivity: selected,
-  });
-
-  await sendTyping(sender, false);
-  await sock.sendMessage(sender, {
-    text: `📎 Atividade selecionada: *${selected.title}*\n\nMande o arquivo da atividade.`,
-  });
 }
 
 async function handleFileSubmission(sender, msg, state) {
@@ -141,10 +187,7 @@ async function handleFileSubmission(sender, msg, state) {
     null;
 
   if (!fileType) {
-    await sendTyping(sender, false);
-    await sock.sendMessage(sender, {
-      text: "❌ Não consegui processar o arquivo. Tente enviar novamente.",
-    });
+    await sendMessage(sender, "❌ Não consegui processar o arquivo. Tente enviar novamente.");
     return;
   }
 
@@ -176,22 +219,16 @@ async function handleFileSubmission(sender, msg, state) {
   const platformLabel = state.platform === "google" ? "Google Classroom" : "AVA";
   const submitEndpoint = state.platform === "google" ? "/classroom/submit" : "/ava/submit";
 
-  await sendTyping(sender, false);
-  await sock.sendMessage(sender, { text: `⏳ Enviando sua atividade para o ${platformLabel}...` });
+  await sendMessage(sender, `⏳ Enviando sua atividade para o ${platformLabel}...`);
 
   const result = await callApiMultipart(submitEndpoint, form);
 
   conversationState.delete(sender);
 
-  await sendTyping(sender, false);
   if (result.ok) {
-    await sock.sendMessage(sender, {
-      text: `✅ Atividade *${selected.title}* entregue com sucesso no ${platformLabel}! 🎉`,
-    });
+    await sendMessage(sender, `✅ Atividade *${selected.title}* entregue com sucesso no ${platformLabel}! 🎉`);
   } else {
-    await sock.sendMessage(sender, {
-      text: `❌ Falha ao enviar: ${result.error || "Erro desconhecido."}`,
-    });
+    await sendMessage(sender, `❌ Falha ao enviar: ${result.error || "Erro desconhecido."}`);
   }
 }
 
@@ -206,11 +243,41 @@ async function handleMessage(sock, sender, msg) {
     msg.message?.extendedTextMessage?.text?.trim() ||
     "";
 
+  if (text) addToHistory(sender, "user", text);
+
   // ── In-progress conversation states take absolute priority ────────
   const state = conversationState.get(sender);
 
+  if (state?.step === "AWAITING_ACTIVITY_SELECTION") {
+    const matched = state.activities?.find(
+      (a) => a.title.toLowerCase().trim() === text.toLowerCase().trim()
+    );
+    if (matched) {
+      conversationState.set(sender, { ...state, step: "AWAITING_FILE", selectedActivity: matched });
+      await sendMessage(sender, `📎 Atividade selecionada: *${matched.title}*\n\nAgora é só me mandar o arquivo! 😊`);
+      return;
+    }
+    // Text doesn't match any activity title — clear state and fall through to normal classification
+    conversationState.delete(sender);
+  }
+
   if (state?.step === "AWAITING_ACTIVITY_NUMBER") {
-    await handleActivityNumberInput(sender, text, state);
+    const matched = state.activities?.find(
+      (a) => a.title.toLowerCase().trim() === text.toLowerCase().trim()
+    );
+    if (matched) {
+      conversationState.set(sender, { ...state, step: "AWAITING_FILE", selectedActivity: matched });
+      await sendMessage(sender, `📎 Atividade selecionada: *${matched.title}*\n\nAgora mande o arquivo da atividade.`);
+    } else {
+      const index = parseInt(text.trim(), 10) - 1;
+      if (!isNaN(index) && index >= 0 && state.activities && index < state.activities.length) {
+        const selected = state.activities[index];
+        conversationState.set(sender, { ...state, step: "AWAITING_FILE", selectedActivity: selected });
+        await sendMessage(sender, `📎 Atividade selecionada: *${selected.title}*\n\nAgora mande o arquivo da atividade.`);
+      } else {
+        await sendMessage(sender, "❌ Não encontrei essa atividade. Acesse o link novamente e clique na atividade desejada.");
+      }
+    }
     return;
   }
 
@@ -225,20 +292,14 @@ async function handleMessage(sock, sender, msg) {
     if (hasFile) {
       await handleFileSubmission(sender, msg, state);
     } else {
-      await sendTyping(sender, false);
-      await sock.sendMessage(sender, {
-        text: "📎 Por favor, envie o arquivo da atividade.",
-      });
+      await sendMessage(sender, "📎 Por favor, envie o arquivo da atividade.");
     }
     return;
   }
 
   // ── Skip classification if no text (file sent outside of a flow) ─
   if (!text) {
-    await sendTyping(sender, false);
-    await sock.sendMessage(sender, {
-      text: "Olá! 👋 Sou seu assistente acadêmico. Envie uma mensagem de texto para começarmos!",
-    });
+    await sendMessage(sender, "Olá! 👋 Sou seu assistente acadêmico. Envie uma mensagem de texto para começarmos!");
     return;
   }
 
@@ -252,14 +313,13 @@ async function handleMessage(sock, sender, msg) {
   let platform = deterministic.platform;
 
   if (!deterministic.matched) {
-    aiResult = await classifyWithGemini(text, {}, sender);
+    aiResult = await classifyWithGemini(text, {}, sender, getHistory(sender));
     finalIntent = aiResult.intent;
     chatResponse = aiResult.chatResponse;
     platform = aiResult.platform || deterministic.platform;
 
     if (aiResult.requiresPlatformChoice || finalIntent === "AMBIGUOUS_PLATFORM") {
-      await sendTyping(sender, false);
-      await sock.sendMessage(sender, { text: chatResponse });
+      await sendMessage(sender, chatResponse);
       return;
     }
   }
@@ -268,18 +328,54 @@ async function handleMessage(sock, sender, msg) {
 
   switch (finalIntent) {
 
+    case "POST_LOGIN_GOOGLE": {
+      try {
+        const data = await callApi(
+          `/classroom/activities?whatsappNumber=${encodeURIComponent(sender)}`
+        );
+        if (data.error || !data.activities || data.activities.length === 0) {
+          await sendMessage(sender, "✅ Google Classroom conectado! Não encontrei atividades pendentes por agora.");
+          break;
+        }
+        const lines = data.activities.map((a) => {
+          const deadline = a.dueDate
+            ? ` — 📅 ${new Date(a.dueDate).toLocaleDateString("pt-BR")}`
+            : "";
+          return `📚 ${a.courseName} - ${a.title}${deadline}`;
+        });
+        await sendMessage(sender, `✅ Google Classroom conectado! Aqui estão suas atividades:\n\n${lines.join("\n")}`);
+      } catch (error) {
+        await sendMessage(sender, "✅ Login realizado! Tive um problema ao buscar suas atividades, mas já estamos conectados.");
+      }
+      break;
+    }
+
+    case "POST_LOGIN_AVA": {
+      try {
+        const data = await callApi(
+          `/ava/activities?whatsappNumber=${encodeURIComponent(sender)}`
+        );
+        if (data.error || !data.activities || data.activities.length === 0) {
+          await sendMessage(sender, "✅ AVA conectado! Não encontrei atividades pendentes por agora.");
+          break;
+        }
+        const lines = data.activities.map((a) => {
+          const deadline = a.dueDate
+            ? ` — 📅 ${new Date(a.dueDate).toLocaleDateString("pt-BR")}`
+            : "";
+          return `📚 ${a.courseName} - ${a.title}${deadline}`;
+        });
+        await sendMessage(sender, `✅ AVA conectado! Aqui estão suas atividades:\n\n${lines.join("\n")}`);
+      } catch (error) {
+        await sendMessage(sender, "✅ Login realizado! Tive um problema ao buscar suas atividades, mas já estamos conectados.");
+      }
+      break;
+    }
+
     case "GREETING":
-      await sendTyping(sender, false);
-      await sock.sendMessage(sender, {
-        text: chatResponse ||
-          "Olá! 👋 Sou seu assistente acadêmico pessoal. Estou aqui para te ajudar com suas atividades, prazos e muito mais!\n\n" +
-          "Você pode me pedir coisas como:\n" +
-          "• *atividades ava* — ver suas tarefas no AVA\n" +
-          "• *atividades google* — ver suas tarefas no Google Classroom\n" +
-          "• *entregar atividade ava* — entregar uma atividade no AVA\n" +
-          "• *ava* ou *google* — conectar suas contas\n\n" +
-          "Como posso te ajudar hoje? 😊",
-      });
+      await sendMessage(sender, chatResponse ||
+        "Olá! 👋 Sou o UniEntrega, seu assistente acadêmico. Estou aqui para te ajudar com atividades, prazos e entregas!\n\nVocê pode me pedir coisas como:\n- Ver suas tarefas no AVA\n- Ver suas tarefas no Google Classroom\n- Entregar uma atividade no AVA\n- Ver o prazo das suas atividades\n\n Como posso te ajudar hoje? 😊"
+      );
       break;
 
     case "CONNECT_GOOGLE": {
@@ -288,29 +384,14 @@ async function handleMessage(sock, sender, msg) {
           `/auth/status?whatsappNumber=${encodeURIComponent(sender)}`
         );
         if (statusData.googleConnected) {
-          await sendTyping(sender, false);
-          await sock.sendMessage(sender, { text: "✅ Você já está conectado ao Google Classroom!" });
+          await sendMessage(sender, "✅ Você já está conectado ao Google Classroom!");
           return;
         }
-        const data = await callApi(
-          `/auth/google/start?whatsappNumber=${encodeURIComponent(sender)}`
-        );
-        await sendTyping(sender, false);
-        if (data.authUrl) {
-          await sock.sendMessage(sender, {
-            text: `🔗 Clique no link abaixo para conectar sua conta do Google Classroom:\n\n${data.authUrl}`,
-          });
-        } else {
-          await sock.sendMessage(sender, {
-            text: "❌ Não foi possível gerar o link de autenticação. Tente novamente.",
-          });
-        }
+        const googleLoginUrl = await getCleanUrl("/entrar/google", sender);
+        await sendMessage(sender, `🔗 Clique no link abaixo para conectar sua conta do Google Classroom:\n\n${googleLoginUrl}`);
       } catch (error) {
         console.error("[WhatsApp] Error fetching Google auth URL:", error.message);
-        await sendTyping(sender, false);
-        await sock.sendMessage(sender, {
-          text: "❌ Erro ao conectar com o serviço. Tente novamente em instantes.",
-        });
+        await sendMessage(sender, "❌ Erro ao conectar com o serviço. Tente novamente em instantes.");
       }
       break;
     }
@@ -321,97 +402,81 @@ async function handleMessage(sock, sender, msg) {
           `/auth/status?whatsappNumber=${encodeURIComponent(sender)}`
         );
         if (statusData.avaConnected) {
-          await sendTyping(sender, false);
-          await sock.sendMessage(sender, { text: "✅ Você já está conectado ao AVA!" });
+          await sendMessage(sender, "✅ Você já está conectado ao AVA!");
           return;
         }
-        const data = await callApi(
-          `/auth/ava/start?whatsappNumber=${encodeURIComponent(sender)}`
+        const avaLoginUrl = await getCleanUrl("/entrar/ava", sender);
+        await sendMessage(sender,
+          `🎓 Clique no link abaixo para conectar sua conta do AVA (Moodle):\n\n${avaLoginUrl}\n\n` +
+          `_Insira seu usuário e senha do AVA no formulário que vai abrir._`
         );
-        await sendTyping(sender, false);
-        if (data.formUrl) {
-          await sock.sendMessage(sender, {
-            text:
-              `🎓 Clique no link abaixo para conectar sua conta do AVA (Moodle):\n\n${data.formUrl}\n\n` +
-              `_Insira seu usuário e senha do AVA no formulário que vai abrir._`,
-          });
-        } else {
-          await sock.sendMessage(sender, {
-            text: "❌ Não foi possível gerar o link de acesso ao AVA. Tente novamente.",
-          });
-        }
       } catch (error) {
         console.error("[WhatsApp] Error fetching AVA login URL:", error.message);
-        await sendTyping(sender, false);
-        await sock.sendMessage(sender, {
-          text: "❌ Erro ao conectar com o serviço. Tente novamente em instantes.",
-        });
+        await sendMessage(sender, "❌ Erro ao conectar com o serviço. Tente novamente em instantes.");
       }
       break;
     }
 
     case "LIST_GOOGLE_ACTIVITIES": {
+      const authed = await checkAuth(sender, "google");
+      if (!authed) break;
       try {
         const data = await callApi(
           `/classroom/activities?whatsappNumber=${encodeURIComponent(sender)}`
         );
-        await sendTyping(sender, false);
         if (data.error) {
-          await sock.sendMessage(sender, { text: `⚠️ ${data.error}` });
-          return;
+          await sendMessage(sender, `⚠️ ${data.error}`);
+          break;
         }
         if (!data.activities || data.activities.length === 0) {
-          await sock.sendMessage(sender, { text: "📭 Não há atividades no Google Classroom." });
-          return;
+          await sendMessage(sender, "📭 Não há atividades no Google Classroom.");
+          break;
         }
-        const lines = data.activities.map((a) => `📚 ${a.courseName} - ${a.title} - ${a.link}`);
-        await sock.sendMessage(sender, {
-          text: `📋 *Suas atividades no Google Classroom:*\n\n${lines.join("\n")}`,
+        const lines = data.activities.map((a) => {
+          const deadline = a.dueDate
+            ? ` — 📅 ${new Date(a.dueDate).toLocaleDateString("pt-BR")}`
+            : "";
+          return `📚 ${a.courseName} - ${a.title}${deadline}`;
         });
+        await sendMessage(sender, `📋 *Suas atividades no Google Classroom:*\n\n${lines.join("\n")}`);
       } catch (error) {
         console.error("[WhatsApp] Error fetching Google activities:", error.message);
-        await sendTyping(sender, false);
-        await sock.sendMessage(sender, {
-          text: "❌ Erro ao buscar atividades. Tente novamente em instantes.",
-        });
+        await sendMessage(sender, "❌ Erro ao buscar atividades. Tente novamente em instantes.");
       }
       break;
     }
 
     case "LIST_AVA_ACTIVITIES": {
+      const authed = await checkAuth(sender, "ava");
+      if (!authed) break;
       try {
         const data = await callApi(
           `/ava/activities?whatsappNumber=${encodeURIComponent(sender)}`
         );
-        await sendTyping(sender, false);
         if (data.error) {
-          await sock.sendMessage(sender, { text: `⚠️ ${data.error}` });
-          return;
+          await sendMessage(sender, `⚠️ ${data.error}`);
+          break;
         }
         if (!data.activities || data.activities.length === 0) {
-          await sock.sendMessage(sender, { text: "📭 Não há atividades no AVA." });
-          return;
+          await sendMessage(sender, "📭 Não há atividades no AVA.");
+          break;
         }
-        const lines = data.activities.map((a) => `📚 ${a.courseName} - ${a.title}`);
-        await sock.sendMessage(sender, {
-          text: `📋 *Suas atividades no AVA:*\n\n${lines.join("\n")}`,
+        const lines = data.activities.map((a) => {
+          const deadline = a.dueDate
+            ? ` — 📅 ${new Date(a.dueDate).toLocaleDateString("pt-BR")}`
+            : "";
+          return `📚 ${a.courseName} - ${a.title}${deadline}`;
         });
+        await sendMessage(sender, `📋 *Suas atividades no AVA:*\n\n${lines.join("\n")}`);
       } catch (error) {
         console.error("[WhatsApp] Error fetching AVA activities:", error.message);
-        await sendTyping(sender, false);
-        await sock.sendMessage(sender, {
-          text: "❌ Erro ao buscar atividades do AVA. Tente novamente em instantes.",
-        });
+        await sendMessage(sender, "❌ Erro ao buscar atividades do AVA. Tente novamente em instantes.");
       }
       break;
     }
 
     case "LIST_ACTIVITIES": {
-      await sendTyping(sender, false);
-      await sock.sendMessage(sender, {
-        text: chatResponse ||
-          "📚 Ótimo, vou buscar suas atividades! Mas me diz: você quer ver as atividades do *Google Classroom* ou do *AVA*?",
-      });
+      await sendMessage(sender, chatResponse || "📚 Ótimo! Você quer ver as atividades do Google Classroom ou do AVA?");
       break;
     }
 
@@ -421,39 +486,104 @@ async function handleMessage(sock, sender, msg) {
     }
 
     case "SUBMIT_GOOGLE": {
-      await sendTyping(sender, false);
-      await sock.sendMessage(sender, {
-        text:
-          "⏳ A entrega de atividades pelo Google Classroom ainda não está disponível.\n\n" +
-          "Estamos trabalhando nessa funcionalidade e em breve você poderá entregar suas atividades por aqui. Fique atento às novidades! 🚀",
-      });
+      await sendMessage(sender,
+        "⏳ A entrega de atividades pelo Google Classroom ainda não está disponível.\n\n" +
+        "Estamos trabalhando nessa funcionalidade e em breve você poderá entregar suas atividades por aqui. Fique atento às novidades! 🚀"
+      );
       break;
     }
 
     case "SUBMIT_ACTIVITY": {
-      await sendTyping(sender, false);
-      await sock.sendMessage(sender, {
-        text: chatResponse ||
-          "📬 Para entregar uma atividade, especifique a plataforma:\n\n" +
-          "• Digite *entregar atividade ava* para entregar no AVA (Moodle)\n" +
-          "• Digite *entregar atividade google* para entregar no Google Classroom",
-      });
+      await sendMessage(sender, chatResponse || "📬 Entendido! Você quer entregar pelo AVA ou pelo Google Classroom?");
+      break;
+    }
+
+    case "GET_AVA_DEADLINES": {
+      const authed = await checkAuth(sender, "ava");
+      if (!authed) break;
+      try {
+        const data = await callApi(
+          `/ava/deadlines?whatsappNumber=${encodeURIComponent(sender)}`
+        );
+        if (data.error) {
+          await sendMessage(sender, `⚠️ ${data.error}`);
+          break;
+        }
+        const upcoming = (data.activities || []).filter(
+          (a) => a.dueDate && new Date(a.dueDate) > new Date()
+        );
+        if (upcoming.length === 0) {
+          await sendMessage(sender, "📭 Nenhuma atividade com prazo definido no AVA.");
+          break;
+        }
+        const lines = upcoming.slice(0, 10).map((a) => {
+          const days = Math.ceil((new Date(a.dueDate) - new Date()) / (1000 * 60 * 60 * 24));
+          const dateStr = new Date(a.dueDate).toLocaleDateString("pt-BR");
+          const urgency = days <= 2 ? "🔴" : days <= 7 ? "🟡" : "🟢";
+          return `${urgency} *${a.title}*\n   ${a.courseName} — ${dateStr} (${days}d)`;
+        });
+        const nextMsg = data.nextDeadline
+          ? `\n\n📌 *Mais urgente:* ${data.nextDeadline.title} — ${new Date(data.nextDeadline.dueDate).toLocaleDateString("pt-BR")}`
+          : "";
+        await sendMessage(sender, `⏰ *Próximos prazos no AVA:*\n\n${lines.join("\n\n")}${nextMsg}`);
+      } catch (error) {
+        await sendMessage(sender, "❌ Erro ao buscar prazos do AVA.");
+      }
+      break;
+    }
+
+    case "GET_GOOGLE_DEADLINES": {
+      const authed = await checkAuth(sender, "google");
+      if (!authed) break;
+      try {
+        const data = await callApi(
+          `/classroom/deadlines?whatsappNumber=${encodeURIComponent(sender)}`
+        );
+        if (data.error) {
+          await sendMessage(sender, `⚠️ ${data.error}`);
+          break;
+        }
+        const upcoming = (data.activities || []).filter(
+          (a) => a.dueDate && new Date(a.dueDate) > new Date()
+        );
+        if (upcoming.length === 0) {
+          await sendMessage(sender, "📭 Nenhuma atividade com prazo definido no Google Classroom.");
+          break;
+        }
+        const lines = upcoming.slice(0, 10).map((a) => {
+          const days = Math.ceil((new Date(a.dueDate) - new Date()) / (1000 * 60 * 60 * 24));
+          const dateStr = new Date(a.dueDate).toLocaleDateString("pt-BR");
+          const urgency = days <= 2 ? "🔴" : days <= 7 ? "🟡" : "🟢";
+          return `${urgency} *${a.title}*\n   ${a.courseName} — ${dateStr} (${days}d)`;
+        });
+        const nextMsg = data.nextDeadline
+          ? `\n\n📌 *Mais urgente:* ${data.nextDeadline.title} — ${new Date(data.nextDeadline.dueDate).toLocaleDateString("pt-BR")}`
+          : "";
+        await sendMessage(sender, `⏰ *Próximos prazos no Google Classroom:*\n\n${lines.join("\n\n")}${nextMsg}`);
+      } catch (error) {
+        await sendMessage(sender, "❌ Erro ao buscar prazos do Google Classroom.");
+      }
+      break;
+    }
+
+    case "GET_DEADLINES": {
+      await sendMessage(sender, chatResponse || "⏰ Quer ver os prazos do AVA ou do Google Classroom?");
+      break;
+    }
+
+    case "GET_GRADES":
+    case "GET_MATERIALS": {
+      await sendMessage(sender, "📊 Essa funcionalidade ainda está em desenvolvimento e chegará em breve!");
       break;
     }
 
     case "CHAT":
     default: {
       if (chatResponse) {
-        await sendTyping(sender, false);
-        await sock.sendMessage(sender, { text: chatResponse });
-
+        await sendMessage(sender, chatResponse);
       } else {
-        await sendTyping(sender, false);
         await sock.sendMessage(sender, {
-          text:
-            "Hmm, não entendi muito bem. 🤔 Sou seu assistente acadêmico — " +
-            "posso te ajudar com atividades, prazos e entregas!\n\n" +
-            "Tente perguntar algo como *atividades ava* ou *entregar atividade ava*. 😊",
+          text: "Hmm, não entendi muito bem. 🤔 Sou seu assistente acadêmico — posso te ajudar com atividades, prazos e entregas!",
         });
       }
       break;
